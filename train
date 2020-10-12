@@ -1,0 +1,244 @@
+from torchio.transforms import (
+    RandomFlip,
+    RandomAffine,
+    RandomElasticDeformation,
+    RandomNoise,
+    RandomMotion,
+    RandomBiasField,
+    RescaleIntensity,
+    Resample,
+    ToCanonical,
+    ZNormalization,
+    CropOrPad,
+    HistogramStandardization,
+    OneOf,
+    Compose,
+)
+
+
+#Having a look at a sample
+one_subject = dataset[0]
+print(one_subject)
+print(one_subject.mri)
+
+#Normalisation
+landmarks = tio.HistogramStandardization.train(
+    image_paths,
+    output_path=histogram_landmarks_path,
+)
+np.set_printoptions(suppress=True, precision=3)
+print('\nTrained landmarks:', landmarks)
+
+#Histogram standardisation
+#Hist standardization
+landmarks_dict = {'mri': landmarks}
+histogram_transform = tio.HistogramStandardization(landmarks_dict)
+
+#Z-Norm
+znorm_transform = tio.ZNormalization(masking_method=tio.ZNormalization.mean)
+
+sample = dataset[0]
+transform = tio.Compose([histogram_transform, znorm_transform])
+znormed = transform(sample)
+
+fig, ax = plt.subplots(dpi=100)
+plot_histogram(ax, znormed.mri.data, label='Z-normed', alpha=1)
+ax.set_title('Intensity values of one sample after z-normalization')
+ax.set_xlabel('Intensity')
+ax.grid()
+
+
+training_transform = Compose([
+    ToCanonical(),
+  #  Resample(4),
+    CropOrPad((112, 112, 48), padding_mode='reflect'),
+    RandomMotion(),
+    HistogramStandardization({'mri': landmarks}),
+    RandomBiasField(),
+    ZNormalization(masking_method=ZNormalization.mean),
+    RandomNoise(),
+  #  RandomFlip(axes=(0,)),
+    OneOf({
+        RandomAffine(): 0.8,
+        RandomElasticDeformation(): 0.2,
+    }),
+])
+
+validation_transform = Compose([
+    ToCanonical(),
+  #  Resample(4),
+    CropOrPad((112, 112, 48), padding_mode='reflect'),
+    HistogramStandardization({'mri': landmarks}),
+    ZNormalization(masking_method=ZNormalization.mean),
+])
+
+num_subjects = len(dataset)
+num_training_subjects = int(training_split_ratio * num_subjects)
+
+training_subjects = subjects[:num_training_subjects]
+validation_subjects = subjects[num_training_subjects:]
+
+training_set = tio.SubjectsDataset(
+    training_subjects, transform=training_transform)
+
+validation_set = tio.SubjectsDataset(
+    validation_subjects, transform=validation_transform)
+
+print('Training set:', len(training_set), 'subjects')
+print('Validation set:', len(validation_set), 'subjects')
+
+
+
+#@title (Deep learning functions, double-click here to expand)
+device = torch.device('cuda') if torch.cuda.is_available() else 'cpu'
+CHANNELS_DIMENSION = 1
+SPATIAL_DIMENSIONS = 2, 3, 4
+
+class Action(enum.Enum):
+    TRAIN = 'Training'
+    VALIDATE = 'Validation'
+
+def prepare_batch(batch, device):
+    inputs = batch['mri'][DATA].to(device)
+    foreground = batch['heart'][DATA].to(device)
+    foreground1 = torch.where(foreground == 1,torch.ones(16,1,112,112,48).to(device),torch.zeros(16,1,112,112,48).to(device)).to(device)
+    foreground2 = torch.where(foreground == 2,torch.empty(16,1,112,112,48).fill_(2).to(device),torch.zeros(16,1,112,112,48).to(device)).to(device)
+    foreground3 = torch.where(foreground == 3,torch.empty(16,1,112,112,48).fill_(3).to(device),torch.zeros(16,1,112,112,48).to(device)).to(device)
+    foreground4 = torch.where(foreground == 4,torch.empty(16,1,112,112,48).fill_(4).to(device),torch.zeros(16,1,112,112,48).to(device)).to(device)
+    foreground5 = torch.where(foreground == 5,torch.empty(16,1,112,112,48).fill_(5).to(device),torch.zeros(16,1,112,112,48).to(device)).to(device)
+    foreground6 = torch.where(foreground == 6,torch.empty(16,1,112,112,48).fill_(6).to(device),torch.zeros(16,1,112,112,48).to(device)).to(device)
+    background = 1 - (foreground1+foreground2+foreground3+foreground4+foreground5+foreground6)
+    targets = torch.cat((background,foreground1,foreground2,foreground3,foreground4,foreground5,foreground6), dim=CHANNELS_DIMENSION)
+    return inputs, targets
+
+def get_dice_score(output, target, epsilon=1e-9):
+    p0 = output
+    g0 = target
+    p1 = 1 - p0
+    g1 = 1 - g0
+    tp = (p0 * g0).sum(dim=SPATIAL_DIMENSIONS)
+    fp = (p0 * g1).sum(dim=SPATIAL_DIMENSIONS)
+    fn = (p1 * g0).sum(dim=SPATIAL_DIMENSIONS)
+    num = 2 * tp
+    denom = 2 * tp + fp + fn + epsilon
+    dice_score = num / denom
+    return dice_score
+
+def get_dice_loss(output, target):
+    return 1 - get_dice_score(output, target)
+
+def forward(model, inputs):
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        logits = model(inputs)
+    return logits
+
+def get_model_and_optimizer(device):
+    model = UNet(
+        in_channels=1,
+        out_classes=7,
+        dimensions=3,
+        num_encoding_blocks=3,
+        out_channels_first_layer=8,
+        normalization='batch',
+        upsampling_type='linear',
+        padding=True,
+        activation='PReLU',
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters())
+    return model, optimizer
+
+def run_epoch(epoch_idx, action, loader, model, optimizer):
+    is_training = action == Action.TRAIN
+    epoch_losses = []
+    model.train(is_training)
+    for batch_idx, batch in enumerate(tqdm(loader)):
+        inputs, targets = prepare_batch(batch, device)
+        optimizer.zero_grad()
+        with torch.set_grad_enabled(is_training):
+            logits = forward(model, inputs)
+            probabilities = F.softmax(logits, dim=CHANNELS_DIMENSION)
+            batch_losses = get_dice_loss(probabilities, targets)
+            batch_loss = batch_losses.mean()
+            if is_training:
+                batch_loss.backward()
+                optimizer.step()
+            epoch_losses.append(batch_loss.item())
+    epoch_losses = np.array(epoch_losses)
+    print(f'{action.value} mean loss: {epoch_losses.mean():0.3f}')
+
+def train(num_epochs, training_loader, validation_loader, model, optimizer, weights_stem):
+    run_epoch(0, Action.VALIDATE, validation_loader, model, optimizer)
+    for epoch_idx in range(1, num_epochs + 1):
+        print('Starting epoch', epoch_idx)
+        run_epoch(epoch_idx, Action.TRAIN, training_loader, model, optimizer)
+        run_epoch(epoch_idx, Action.VALIDATE, validation_loader, model, optimizer)
+        torch.save(model.state_dict(), f'{weights_stem}_epoch_{epoch_idx}.pth')
+
+
+
+training_instance = training_set[42]  # transform is applied in SubjectsDataset
+show_subject(training_instance, 'mri', label_name='heart')
+
+validation_instance = validation_set[42]
+show_subject(validation_instance, 'mri', label_name='heart')
+
+training_batch_size = 8
+validation_batch_size = 2 * training_batch_size
+
+training_loader = torch.utils.data.DataLoader(
+    training_set,
+    batch_size=training_batch_size,
+    shuffle=True,
+    num_workers=multiprocessing.cpu_count(),
+)
+
+validation_loader = torch.utils.data.DataLoader(
+    validation_set,
+    batch_size=validation_batch_size,
+    num_workers=multiprocessing.cpu_count(),
+)
+
+
+one_batch = next(iter(training_loader))
+
+k = 16
+batch_mri = one_batch['mri'][DATA][..., k]
+batch_label = one_batch['heart'][DATA][..., k]
+slices = torch.cat((batch_mri, batch_label))
+image_path = 'batch_whole_images.png'
+save_image(slices, image_path, nrow=training_batch_size//2, normalize=True, scale_each=True, padding=0)
+display.Image(image_path)
+
+
+
+
+
+#TRAIN
+
+model, optimizer = get_model_and_optimizer(device)
+
+if train_whole_images:
+    weights_stem = 'whole_images'
+    train(num_epochs, training_loader, validation_loader, model, optimizer, weights_stem)
+#else:
+ #  weights_path = 'C:\\users\\omkbh\\Downloads\\whole_images_epoch_5.pth'
+ #  #weights_url = 'https://www.dropbox.com/s/h0yxbzfncjj84ep/whole_images_epoch_5.pth?dl=0'
+ #  #!curl --location --silent --output {weights_path} {weights_url}
+ #  model.load_state_dict(torch.load(weights_path))
+
+
+#Outputs the image for ifnerence nifti slice
+batch = next(iter(validation_loader))
+model.eval()
+inputs, targets = prepare_batch(batch, device)
+with torch.no_grad():
+    logits = forward(model, inputs)
+labels = logits.argmax(dim=CHANNELS_DIMENSION, keepdim=True)
+k = 16
+batch_mri = inputs[..., k]
+batch_label = labels[..., k]
+slices = torch.cat((batch_mri, batch_label))
+inf_path = 'inference.png'
+save_image(slices, inf_path, nrow=training_batch_size//2, normalize=True, scale_each=True, padding=0)
+display.Image(inf_path)
